@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>Tim WASD ile yürüyor — three.js</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #9fb6d8; overflow: hidden; font-family: -apple-system, "Helvetica Neue", sans-serif; }
+  canvas { display: block; }
+  #keys { position: fixed; right: 40px; bottom: 40px; display: grid; grid-template-columns: repeat(3, 84px);
+          grid-template-rows: 84px 84px 64px; gap: 10px; }
+  .k { display: flex; align-items: center; justify-content: center; font-size: 38px; font-weight: 700; color: #fff;
+       background: rgba(20, 23, 31, .78); border: 3px solid rgba(255,255,255,.85); border-bottom-width: 7px;
+       border-radius: 12px; box-sizing: border-box; }
+  .k.down { color: #ff9e33; border-color: #ff9e33; background: rgba(60, 36, 12, .9); }
+  #kW { grid-column: 2; grid-row: 1; } #kA { grid-column: 1; grid-row: 2; }
+  #kS { grid-column: 2; grid-row: 2; } #kD { grid-column: 3; grid-row: 2; }
+  #kShift { grid-column: 1 / span 3; grid-row: 3; font-size: 28px; }
+  #info { position: fixed; left: 24px; top: 20px; color: #121a26; font-size: 26px; font-weight: 600;
+          background: rgba(255,255,255,.55); padding: 8px 14px; border-radius: 10px; font-variant-numeric: tabular-nums; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js", "three/addons/": "./vendor/jsm/" } }
+</script>
+</head>
+<body>
+<div id="keys"><div class="k" id="kW">W</div><div class="k" id="kA">A</div><div class="k" id="kS">S</div>
+<div class="k" id="kD">D</div><div class="k" id="kShift">SHIFT · koş</div></div>
+<div id="info">yükleniyor…</div>
+<script type="module">
+// tim_walker.glb (Blender 5.2.2 → glTF; idle 2.0 / walk 1.0 / run 0.6 sn, hepsi YERİNDE döngü).
+// Kurallar Godot player.gd ile aynı: WALK 1.08 m/sn, RUN 2.40 m/sn (Blender'da ölçülen yerdeki-ayak hızı),
+// ACCEL 10 m/sn², dönüş 9 rad/sn, crossfade 0.2 sn, timeScale = hız / klip hızı (0.5–1.5 arası).
+// W = −Z, D = +X (dünya eksenleri, Godot'daki gibi). Model glTF önü +Z'ye bakar → yaw = atan2(x, z).
+//
+// ?auto=1            → senaryolu tuşlar GERÇEK KeyboardEvent olarak window'a gönderilir (W, sonra D, sonra Shift+W, bırak).
+//                      Gerçek zamanlı döngü; her saniye fps yazılır.
+// ?auto=1&capture=1  → sanal saat: simülasyon yalnız window.frame() / window.step(dt) çağrılınca ilerler, kare deterministik.
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const T0 = performance.now();
+const WALK_SPEED = 1.08, RUN_SPEED = 2.40, ACCEL = 10.0, TURN_SPEED = 9.0, BLEND = 0.2, MOVE_EPS = 0.1;
+const DT = 1 / 60;
+const CAM_OFFSET = new THREE.Vector3(5.0, 2.3, 1.8);
+const q = new URLSearchParams(location.search);
+const auto = q.get('auto') === '1';
+const capture = auto && q.get('capture') === '1';
+const AUTO_END = 8.0;
+// [sn, tür, code, key] — keydown/keyup olayları window'a dispatchEvent ile gönderilir
+const AUTO_EVENTS = [
+  [1.0, 'keydown', 'KeyW', 'w'],
+  [3.0, 'keyup',   'KeyW', 'w'],
+  [3.0, 'keydown', 'KeyD', 'd'],
+  [4.6, 'keyup',   'KeyD', 'd'],
+  [4.6, 'keydown', 'ShiftLeft', 'Shift'],
+  [4.6, 'keydown', 'KeyW', 'W'],
+  [6.8, 'keyup',   'KeyW', 'W'],
+  [6.8, 'keyup',   'ShiftLeft', 'Shift'],
+];
+
+const log = (t, msg) => console.log(`[web] ${t.toFixed(2)} sn: ${msg}`);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(capture ? 1 : Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fb6d8);
+scene.fog = new THREE.Fog(0x9fb6d8, 18, 40);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+scene.add(new THREE.HemisphereLight(0xc9d6ea, 0x9a9fa8, 1.6));
+const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+scene.add(fill, fill.target);
+const sun = new THREE.DirectionalLight(0xffffff, 2.4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -5, right: 5, top: 5, bottom: -5, near: 0.5, far: 20 });
+scene.add(sun, sun.target);
+
+// Zemin: 1 m doku = dört 0.5 m kare (iki ton) + her 0.5 m'de beyaz çizgi → hareket ve hız gözle okunur
+const N = 128, cv = document.createElement('canvas'); cv.width = cv.height = N;
+const cx = cv.getContext('2d');
+for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
+  cx.fillStyle = (x + y) % 2 ? '#7a828e' : '#8e96a2'; cx.fillRect(x * N / 2, y * N / 2, N / 2, N / 2);
+}
+cx.fillStyle = '#eceef2';
+for (const p of [0, N / 2]) { cx.fillRect(p, 0, 3, N); cx.fillRect(0, p, N, 3); }
+const tex = new THREE.CanvasTexture(cv);
+tex.colorSpace = THREE.SRGBColorSpace;
+tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(80, 80);
+tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.MeshStandardMaterial({ map: tex, roughness: .95 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+scene.add(ground);
+
+// Yön okunsun diye kutular (Godot main.gd'den; mavi direk ve sarı kutu koşu yolundan / kamera önünden çekildi)
+for (const [p, s, c] of [
+  [[-2.5, -4.5], [0.8, 1.2, 0.8], 0xd95940], [[-1.2, -6.0], [0.6, 2.2, 0.6], 0x408cd9],
+  [[-4.5, -3.0], [1.0, 0.6, 1.0], 0xf2bf40], [[-3.0, 1.5], [0.5, 1.6, 0.5], 0x59b366],
+  [[-3.5, -1.0], [0.4, 1.0, 0.4], 0xb366cc], [[-1.0, -8.0], [1.2, 0.8, 1.2], 0xe68099],
+  [[-2.0, -11.0], [0.7, 1.8, 0.7], 0x4fb3b3], [[2.5, -12.5], [0.9, 1.0, 0.9], 0xd98c40],
+]) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(...s), new THREE.MeshStandardMaterial({ color: c, roughness: .8 }));
+  m.position.set(p[0], s[1] / 2, p[1]); m.castShadow = m.receiveShadow = true; scene.add(m);
+}
+
+// ---- Girdi: yalnız keydown/keyup olaylarından (klavye de senaryo da aynı yoldan) ----
+const keys = { KeyW: false, KeyA: false, KeyS: false, KeyD: false, Shift: false };
+const keyEls = { KeyW: kW, KeyA: kA, KeyS: kS, KeyD: kD, Shift: kShift };
+function onKey(e, down) {
+  const c = (e.code === 'ShiftLeft' || e.code === 'ShiftRight') ? 'Shift' : e.code;
+  if (c in keys) {
+    if (keys[c] !== down) log(st.t, `${e.type} ${e.code} (isTrusted=${e.isTrusted})`);
+    keys[c] = down;
+  }
+}
+addEventListener('keydown', e => onKey(e, true));
+addEventListener('keyup', e => onKey(e, false));
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+// ---- Durum ----
+const st = { t: 0, pos: new THREE.Vector3(), vel: new THREE.Vector3(), yaw: 0, targetYaw: 0,
+             turning: false, turnStartT: 0, turnStartYaw: 0, state: 'idle', stateSince: 0,
+             win: [], nextSpeedLog: 0, autoIdx: 0, contact: {}, maxSlideCm: 0 };
+let model, mixer, actions = {}, feet = [];
+const tmp = new THREE.Vector3();
+
+const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+const deg = r => (r * 180 / Math.PI);
+function rotateToward(from, to, maxDelta) {
+  const d = wrap(to - from);
+  return Math.abs(d) <= maxDelta ? to : from + Math.sign(d) * maxDelta;
+}
+
+function step(dt) {
+  // 1) Senaryo tuşları: sanal saat o ana geldiğinde gerçek KeyboardEvent gönder
+  if (auto) while (st.autoIdx < AUTO_EVENTS.length && AUTO_EVENTS[st.autoIdx][0] <= st.t + 1e-9) {
+    const [, type, code, key] = AUTO_EVENTS[st.autoIdx++];
+    dispatchEvent(new KeyboardEvent(type, { code, key, shiftKey: keys.Shift || code.startsWith('Shift'), bubbles: true }));
+  }
+  st.t += dt;
+
+  // 2) Hareket (Godot: Input.get_vector + move_toward)
+  const dir = new THREE.Vector3((keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), 0, (keys.KeyS ? 1 : 0) - (keys.KeyW ? 1 : 0));
+  const moving = dir.lengthSq() > 1e-4;
+  if (moving) dir.normalize();
+  const running = keys.Shift;
+  const targetSpeed = moving ? (running ? RUN_SPEED : WALK_SPEED) : 0;
+  const want = dir.clone().multiplyScalar(targetSpeed);
+  const dv = want.sub(st.vel), maxDv = ACCEL * dt;
+  if (dv.length() > maxDv) dv.setLength(maxDv);
+  st.vel.add(dv);
+  st.pos.addScaledVector(st.vel, dt);
+  const speed = st.vel.length();
+
+  // 3) Gidilen yöne dön
+  if (moving) {
+    const w = Math.atan2(dir.x, dir.z);
+    if (Math.abs(wrap(st.targetYaw - w)) > 0.01) {
+      st.targetYaw = w; st.turning = true; st.turnStartT = st.t; st.turnStartYaw = st.yaw;
+      log(st.t, `yön değişti, hedef ${deg(w).toFixed(0)}° (şu an ${deg(wrap(st.yaw)).toFixed(0)}°)`);
+    }
+  }
+  st.yaw = rotateToward(st.yaw, st.targetYaw, TURN_SPEED * dt);
+  if (st.turning && Math.abs(wrap(st.yaw - st.targetYaw)) < THREE.MathUtils.degToRad(1)) {
+    st.turning = false;
+    log(st.t, `dönüş bitti, ${deg(wrap(st.turnStartYaw)).toFixed(0)}° → ${deg(st.targetYaw).toFixed(0)}° ` +
+      `(${deg(Math.abs(wrap(st.turnStartYaw - st.targetYaw))).toFixed(0)}° dönüş, ${(st.t - st.turnStartT).toFixed(2)} sn)`);
+  }
+
+  // 4) Animasyon durumu: idle ↔ walk ↔ run, crossFadeTo 0.2 sn; timeScale gerçek hıza ölçekli
+  // Shift + W birlikte bırakılınca yavaşlarken 0.2 sn'lik gereksiz 'walk' ara durumu olmasın: hız yürüyüşün üstündeyse koşu kalır
+  const runAnim = (running && moving) || (!moving && st.state === 'run') || speed > WALK_SPEED * 1.2;
+  const wantState = speed > MOVE_EPS ? (runAnim ? 'run' : 'walk') : 'idle';
+  if (wantState !== st.state) {
+    log(st.t, `${st.state} → ${wantState} (hız ${speed.toFixed(2)} m/sn, crossFadeTo ${BLEND} sn)`);
+    const from = actions[st.state], to = actions[wantState];
+    to.reset().setEffectiveWeight(1).play();
+    from.crossFadeTo(to, BLEND, false);
+    st.state = wantState; st.stateSince = st.t;
+  }
+  actions.walk.setEffectiveTimeScale(THREE.MathUtils.clamp(speed / WALK_SPEED, 0.5, 1.5));
+  actions.run.setEffectiveTimeScale(THREE.MathUtils.clamp(speed / RUN_SPEED, 0.5, 1.5));
+  model.position.copy(st.pos);
+  model.rotation.y = st.yaw;
+  mixer.update(dt);
+  model.updateMatrixWorld(true);
+  measure();
+}
+
+function measure() {
+  // Hız: son 1 sn'deki yatay yer değiştirme (Godot'daki ölçümle aynı)
+  st.win.push([st.t, st.pos.clone()]);
+  while (st.win.length > 1 && st.t - st.win[0][0] > 1.0 + 1e-6) st.win.shift();
+  if (st.t >= st.nextSpeedLog && st.state !== 'idle' && st.t - st.stateSince >= 1.0) {
+    const [t0, p0] = st.win[0];
+    const d = Math.hypot(st.pos.x - p0.x, st.pos.z - p0.z);
+    log(st.t, `ölçülen hız ${(d / (st.t - t0)).toFixed(3)} m/sn (son ${(st.t - t0).toFixed(2)} sn'de ${d.toFixed(3)} m; ` +
+      `anlık ${st.vel.length().toFixed(3)} m/sn, durum ${st.state}, timeScale ${actions[st.state].getEffectiveTimeScale().toFixed(3)}), ` +
+      `konum (${st.pos.x.toFixed(2)}, ${st.pos.z.toFixed(2)})`);
+    st.nextSpeedLog = st.t + 1.0;
+  }
+  // Ayak kayması: yerdeki ayağın bilek kemiği dünya konumu temas boyunca ne kadar oynadı?
+  for (const f of feet) {
+    f.bone.getWorldPosition(tmp);
+    const down = tmp.y <= 0.1005;
+    const steady = st.state !== 'idle' && st.t - st.stateSince > BLEND + 0.05 && !st.turning;
+    const c = st.contact[f.name];
+    if (down && steady) {
+      if (!c) st.contact[f.name] = { start: tmp.clone(), t: st.t, max: 0 };
+      else c.max = Math.max(c.max, Math.hypot(tmp.x - c.start.x, tmp.z - c.start.z));
+    } else if (c) {
+      if (st.t - c.t > 0.15) {
+        log(st.t, `[foot] ${f.name} yerde ${(st.t - c.t).toFixed(2)} sn kaldı (${st.state}), dünyadaki kayması en çok ${(c.max * 100).toFixed(1)} cm`);
+        st.maxSlideCm = Math.max(st.maxSlideCm, c.max * 100);
+      }
+      delete st.contact[f.name];
+    }
+  }
+}
+
+const camLook = new THREE.Vector3();
+function updateCamera(dt, snap) {
+  const target = tmp.copy(st.pos).add(CAM_OFFSET);
+  if (snap) camera.position.copy(target);
+  else camera.position.lerp(target, 1 - Math.exp(-5 * dt));
+  camLook.set(st.pos.x, 1.0, st.pos.z);
+  camera.lookAt(camLook);
+  sun.position.set(st.pos.x + 3, 6, st.pos.z + 4); sun.target.position.copy(st.pos);
+  fill.position.copy(camera.position); fill.target.position.copy(camLook);
+}
+
+function draw() {
+  for (const k in keys) keyEls[k].classList.toggle('down', keys[k]);
+  info.textContent = `t ${st.t.toFixed(2)} sn · ${st.state} · ${st.vel.length().toFixed(2)} m/sn`;
+  renderer.render(scene, camera);
+}
+
+function advance(dt) {           // sabit adım; kamera her adımda (Godot _physics_process gibi)
+  step(dt); updateCamera(dt, false);
+  if (auto && !st.doneLogged && st.t >= AUTO_END - 1e-9) {
+    st.doneLogged = true;
+    log(st.t, `senaryo bitti; konum (${st.pos.x.toFixed(2)}, ${st.pos.z.toFixed(2)}), durum ${st.state}, ` +
+      `ayak kayması en çok ${st.maxSlideCm.toFixed(1)} cm`);
+  }
+}
+
+new GLTFLoader().load('./tim_walker.glb', (gltf) => {
+  const tLoaded = performance.now();
+  model = gltf.scene;
+  model.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  scene.add(model);
+  mixer = new THREE.AnimationMixer(model);
+  for (const a of gltf.animations) actions[a.name] = mixer.clipAction(a);   // varsayılan LoopRepeat
+  for (const n of ['foot_L', 'foot_R']) { const b = model.getObjectByName(n); if (b) feet.push({ name: n, bone: b }); }
+  actions.idle.play();
+  let bones = 0; model.traverse(o => { if (o.isBone) bones++; });
+  const gl = renderer.getContext(), dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  console.log(`[web] three r${THREE.REVISION}; GLB animasyonları: ` +
+    gltf.animations.map(a => `${a.name} ${a.duration.toFixed(3)} sn`).join(', ') + `; ${bones} kemik; ayak kemikleri ${feet.length}`);
+  console.log(`[web] WebGL: ${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)}; ` +
+    `tuval ${renderer.domElement.width}x${renderer.domElement.height}`);
+  console.log(`[web] yükleme: GLB hazır ${(tLoaded - T0).toFixed(0)} ms (modül başlangıcından), ` +
+    `sayfa açılışından ${tLoaded.toFixed(0)} ms; mod: ${capture ? 'capture (sanal saat)' : auto ? 'auto (gerçek zaman)' : 'elle'}`);
+  model.updateMatrixWorld(true);
+  updateCamera(0, true);
+  draw();
+  window.__ready = true;
+  if (!capture) requestAnimationFrame(loop);
+});
+
+// Sanal saat API'si (capture): frame() = 1/30 sn = iki 1/60 adım + çiz
+window.step = (dt = DT) => { advance(dt); };
+window.render = () => draw();
+window.frame = (substeps = 2) => { for (let i = 0; i < substeps; i++) advance(DT); draw(); return st.t; };
+
+// Gerçek zamanlı döngü (elle ve ?auto=1): sabit 1/60 adım + biriktirici; fps ölçümü
+let acc = 0, last = performance.now(), fpsN = 0, fpsT0 = last, fpsAll = [];
+function loop(now) {
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  while (acc >= DT) { advance(DT); acc -= DT; }
+  draw();
+  fpsN++;
+  if (now - fpsT0 >= 1000) {
+    const fps = fpsN * 1000 / (now - fpsT0); fpsAll.push(fps);
+    console.log(`[web] fps ${fps.toFixed(1)} (son ${((now - fpsT0) / 1000).toFixed(2)} sn, ${fpsN} kare, sim t ${st.t.toFixed(2)} sn)`);
+    if (auto && st.doneLogged && !st.fpsDone) {
+      st.fpsDone = true;
+      const s = [...fpsAll].sort((a, b) => a - b);
+      console.log(`[web] fps özeti: ${fpsAll.length} ölçüm, ort ${(fpsAll.reduce((a, b) => a + b, 0) / fpsAll.length).toFixed(1)}, ` +
+        `min ${s[0].toFixed(1)}, max ${s[s.length - 1].toFixed(1)}`);
+      window.__fpsDone = true;
+    }
+    fpsN = 0; fpsT0 = now;
+  }
+  requestAnimationFrame(loop);
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
